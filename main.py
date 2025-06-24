@@ -122,3 +122,10 @@ def get_key_by_title(title: str):
     
     return {"error": "No match found"}
 
+@app.get("/collections/{collection_key}/items")
+def get_items_in_collection(collection_key: str):
+    url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/collections/{collection_key}/items"
+    response = requests.get(url, headers=HEADERS)
+    if response.status_code != 200:
+        return {"error": "Zotero API returned an error", "status": response.status_code}
+    return response.json()
