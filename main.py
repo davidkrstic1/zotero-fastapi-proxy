@@ -40,17 +40,33 @@ def get_item_details(item_key: str):
 
 @app.get("/items/search")
 def search_items_by_title(title: str):
-    url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items?limit=100"  # Limit optional
+    url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items?limit=100"
     try:
         response = requests.get(url, headers=HEADERS)
-        response.raise_for_status()
+        if response.status_code != 200:
+            return {
+                "error": "Zotero API returned non-200 status",
+                "status_code": response.status_code,
+                "body": response.text
+            }
+
+        try:
+            items = response.json()
+        except Exception as e:
+            return {
+                "error": "Failed to parse JSON",
+                "response_text": response.text,
+                "details": str(e)
+            }
+
         results = [
-            item for item in response.json()
+            item for item in items
             if title.lower() in item.get("data", {}).get("title", "").lower()
         ]
         return results
+
     except Exception as e:
-        return {"error": "Search failed", "details": str(e)}
+        return {"error": "Search request failed", "details": str(e)}
 
 @app.get("/items/{item_key}/tags")
 def get_tags_for_item(item_key: str):
