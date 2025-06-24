@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Response, status
 from fastapi.responses import StreamingResponse
 import requests
 import os
@@ -29,7 +29,11 @@ def download_attachment(attachment_key: str):
     url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{attachment_key}/file"
     response = requests.get(url, headers=HEADERS, stream=True)
     if response.status_code != 200:
-        return {"error": "Download failed", "status": response.status_code}
+        return Response(
+            content='{"error": "Download failed"}',
+            media_type="application/json",
+            status_code=404  # ← Das ist entscheidend für GPT
+        )
     return StreamingResponse(response.raw, media_type="application/pdf")
 
 @app.get("/items/{item_key}")
@@ -43,16 +47,7 @@ def get_item_details(item_key: str):
                 "status_code": response.status_code,
                 "body": response.text
             }
-
-        try:
-            return response.json()
-        except Exception as e:
-            return {
-                "error": "Failed to parse JSON",
-                "response_text": response.text,
-                "details": str(e)
-            }
-
+        return response.json()
     except Exception as e:
         return {"error": "Request failed", "details": str(e)}
 
@@ -68,21 +63,12 @@ def search_items_by_title(title: str):
                 "body": response.text
             }
 
-        try:
-            items = response.json()
-        except Exception as e:
-            return {
-                "error": "Failed to parse JSON",
-                "response_text": response.text,
-                "details": str(e)
-            }
-
+        items = response.json()
         results = [
             item for item in items
             if title.lower() in item.get("data", {}).get("title", "").lower()
         ]
         return results
-
     except Exception as e:
         return {"error": "Search request failed", "details": str(e)}
 
@@ -110,16 +96,12 @@ def get_key_by_title(title: str):
     response = requests.get(url, headers=HEADERS)
     if response.status_code != 200:
         return {"error": "Zotero API failed", "status": response.status_code}
-    
-    try:
-        items = response.json()
-    except Exception as e:
-        return {"error": "Invalid JSON", "details": str(e)}
 
+    items = response.json()
     for item in items:
         if title.lower() in item.get("data", {}).get("title", "").lower():
             return {"item_key": item.get("data", {}).get("key")}
-    
+
     return {"error": "No match found"}
 
 @app.get("/collections/{collection_key}/items")
