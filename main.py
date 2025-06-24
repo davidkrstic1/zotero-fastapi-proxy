@@ -166,3 +166,22 @@ def get_items_in_collection(collection_key: str):
         return {"error": "Zotero API returned an error", "status": response.status_code}
     return response.json()
 
+from fastapi.responses import HTMLResponse
+import fitz  # PyMuPDF
+
+@app.get("/attachments/{attachment_key}/html", response_class=HTMLResponse)
+def render_pdf_as_html(attachment_key: str):
+    pdf_path = os.path.join("static", f"{attachment_key}.pdf")
+
+    if not os.path.exists(pdf_path):
+        return Response(content="PDF not found", status_code=404)
+
+    try:
+        doc = fitz.open(pdf_path)
+        html = "<html><body><h2>Extrahierter PDF-Text</h2>"
+        for i, page in enumerate(doc, start=1):
+            html += f"<h3>Seite {i}</h3><p>{page.get_text()}</p><hr>"
+        html += "</body></html>"
+        return HTMLResponse(content=html)
+    except Exception as e:
+        return Response(content=f"Fehler beim Öffnen/Lesen der PDF: {str(e)}", status_code=500)
