@@ -1,8 +1,11 @@
 from fastapi import FastAPI, Response, status
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
+from fastapi.staticfiles import StaticFiles
 import requests
 import os
+import json
+import shutil
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -12,6 +15,12 @@ app = FastAPI()
 ZOTERO_USER_ID = os.getenv("ZOTERO_USER_ID")
 ZOTERO_API_KEY = os.getenv("ZOTERO_API_KEY")
 HEADERS = {"Zotero-API-Key": ZOTERO_API_KEY}
+
+# Static folder mount
+if not os.path.exists("static"):
+    os.makedirs("static")
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/items")
@@ -30,15 +39,24 @@ def get_collections():
 
 @app.get("/attachments/{attachment_key}/download")
 def download_attachment(attachment_key: str):
+    # Prüfe zuerst die Metadaten
     meta_url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{attachment_key}"
     meta_response = requests.get(meta_url, headers=HEADERS)
-    
+
     if meta_response.status_code != 200:
-        return Response(content='{"error": "Attachment metadata not found"}', media_type="application/json", status_code=404)
-    
+        return Response(
+            content='{"error": "Attachment metadata not found"}',
+            media_type="application/json",
+            status_code=404
+        )
+
     data = meta_response.json().get("data", {})
     if data.get("itemType") != "attachment" or data.get("contentType") != "application/pdf":
-        return Response(content='{"error": "Not a valid PDF attachment"}', media_type="application/json", status_code=400)
+        return Response(
+            content='{"error": "Item is not a valid PDF attachment"}',
+            media_type="application/json",
+            status_code=400
+        )
 
     file_url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{attachment_key}/file"
     file_response = requests.get(file_url, headers=HEADERS, stream=True)
@@ -46,25 +64,25 @@ def download_attachment(attachment_key: str):
     if file_response.status_code != 200:
         return Response(
             content=json.dumps({
-                "error": "Download failed",
+                "error": "PDF download failed",
                 "status_code": file_response.status_code,
                 "zotero_message": file_response.text
             }),
             media_type="application/json",
-            status_code=404
+            status_code=file_response.status_code
         )
 
-    def cleanup():
-        file_response.close()
+    # Speichere PDF lokal in static/
+    filename = data.get("filename", f"{attachment_key}.pdf")
+    local_path = os.path.join("static", filename)
 
-    return StreamingResponse(
-        content=file_response.raw,
-        media_type="application/pdf",
-        background=BackgroundTask(cleanup),
-        headers={
-            "Content-Disposition": f'attachment; filename="{data.get("filename", attachment_key + ".pdf")}"'
-        }
-    )
+    with open(local_path, "wb") as f:
+        shutil.copyfileobj(file_response.raw, f)
+
+    return {
+        "pdf_url": f"https://zotero-fastapi-proxy.onrender.com/static/{filename}"
+    }
+
 
 @app.get("/items/{item_key}")
 def get_item_details(item_key: str):
@@ -147,3 +165,4 @@ def get_items_in_collection(collection_key: str):
     if response.status_code != 200:
         return {"error": "Zotero API returned an error", "status": response.status_code}
     return response.json()
+
