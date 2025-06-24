@@ -30,29 +30,41 @@ def get_collections():
 
 @app.get("/attachments/{attachment_key}/download")
 def download_attachment(attachment_key: str):
-    url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{attachment_key}/file"
-    response = requests.get(url, headers=HEADERS, stream=True)
+    meta_url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{attachment_key}"
+    meta_response = requests.get(meta_url, headers=HEADERS)
+    
+    if meta_response.status_code != 200:
+        return Response(content='{"error": "Attachment metadata not found"}', media_type="application/json", status_code=404)
+    
+    data = meta_response.json().get("data", {})
+    if data.get("itemType") != "attachment" or data.get("contentType") != "application/pdf":
+        return Response(content='{"error": "Not a valid PDF attachment"}', media_type="application/json", status_code=400)
 
-    if response.status_code != 200:
+    file_url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{attachment_key}/file"
+    file_response = requests.get(file_url, headers=HEADERS, stream=True)
+
+    if file_response.status_code != 200:
         return Response(
-            content='{"error": "Download failed"}',
+            content=json.dumps({
+                "error": "Download failed",
+                "status_code": file_response.status_code,
+                "zotero_message": file_response.text
+            }),
             media_type="application/json",
             status_code=404
         )
 
     def cleanup():
-        response.close()
+        file_response.close()
 
     return StreamingResponse(
-        content=response.raw,
+        content=file_response.raw,
         media_type="application/pdf",
         background=BackgroundTask(cleanup),
         headers={
-            "Content-Disposition": f'attachment; filename="{attachment_key}.pdf"',
-            "Content-Type": "application/pdf"
+            "Content-Disposition": f'attachment; filename="{data.get("filename", attachment_key + ".pdf")}"'
         }
     )
-
 
 @app.get("/items/{item_key}")
 def get_item_details(item_key: str):
