@@ -40,10 +40,17 @@ def get_item_details(item_key: str):
 
 @app.get("/items/search")
 def search_items_by_title(title: str):
-    url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items"
-    response = requests.get(url, headers=HEADERS)
-    results = [item for item in response.json() if title.lower() in item.get("data", {}).get("title", "").lower()]
-    return results
+    url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items?limit=100"  # Limit optional
+    try:
+        response = requests.get(url, headers=HEADERS)
+        response.raise_for_status()
+        results = [
+            item for item in response.json()
+            if title.lower() in item.get("data", {}).get("title", "").lower()
+        ]
+        return results
+    except Exception as e:
+        return {"error": "Search failed", "details": str(e)}
 
 @app.get("/items/{item_key}/tags")
 def get_tags_for_item(item_key: str):
