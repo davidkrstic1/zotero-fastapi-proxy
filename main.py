@@ -159,12 +159,30 @@ def get_key_by_title(title: str):
 
 
 @app.get("/collections/{collection_key}/items")
-def get_items_in_collection(collection_key: str):
-    url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/collections/{collection_key}/items"
-    response = requests.get(url, headers=HEADERS)
-    if response.status_code != 200:
-        return {"error": "Zotero API returned an error", "status": response.status_code}
-    return response.json()
+def get_items_in_collection(collection_key: str, limit: int = 50):
+    items = []
+    start = 0
+    while True:
+        url = (
+            f"https://api.zotero.org/users/{ZOTERO_USER_ID}/collections/{collection_key}/items"
+            f"?limit={limit}&start={start}"
+        )
+        response = requests.get(url, headers=HEADERS)
+        if response.status_code != 200:
+            return {"error": "Zotero API returned an error", "status": response.status_code}
+
+        batch = response.json()
+        if not batch:
+            break
+
+        items.extend(batch)
+        if len(batch) < limit:
+            break
+
+        start += limit
+
+    return items
+
 
 from fastapi.responses import HTMLResponse
 import fitz  # PyMuPDF
