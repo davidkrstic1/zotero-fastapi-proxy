@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 import requests
 import os
 from dotenv import load_dotenv
@@ -30,7 +30,13 @@ def download_attachment(attachment_key: str):
     response = requests.get(url, headers=HEADERS, stream=True)
     if response.status_code != 200:
         return {"error": "Download failed", "status": response.status_code}
-    return StreamingResponse(response.raw, media_type="application/pdf")
+
+    temp_filename = f"/tmp/{attachment_key}.pdf"
+    with open(temp_filename, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+    return FileResponse(temp_filename, media_type="application/pdf", filename=f"{attachment_key}.pdf")
 
 @app.get("/items/{item_key}")
 def get_item_details(item_key: str):
