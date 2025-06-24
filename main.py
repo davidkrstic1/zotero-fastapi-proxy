@@ -203,3 +203,39 @@ def render_pdf_as_html(attachment_key: str):
         return HTMLResponse(content=html)
     except Exception as e:
         return Response(content=f"Fehler beim Öffnen/Lesen der PDF: {str(e)}", status_code=500)
+
+@app.get("/collections/{collection_key}/items-with-pdfs")
+def get_items_with_pdfs(collection_key: str, limit: int = 50):
+    collected_items = []
+    start = 0
+
+    while True:
+        url = (
+            f"https://api.zotero.org/users/{ZOTERO_USER_ID}/collections/{collection_key}/items"
+            f"?limit={limit}&start={start}&include=children"
+        )
+        response = requests.get(url, headers=HEADERS)
+        if response.status_code != 200:
+            return {"error": "Zotero API returned an error", "status": response.status_code}
+        
+        items = response.json()
+        if not items:
+            break
+
+        for item in items:
+            if item.get("data", {}).get("itemType") in ("note", "annotation", "attachment"):
+                continue  # ignoriere irrelevante Typen
+            key = item.get("data", {}).get("key")
+            children_url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{key}/children"
+            children_resp = requests.get(children_url, headers=HEADERS)
+            if children_resp.status_code == 200:
+                children = children_resp.json()
+                if any(child.get("data", {}).get("contentType") == "application/pdf" for child in children):
+                    collected_items.append(item)
+
+        if len(items) < limit:
+            break
+        start += limit
+
+    return collected_items
+
