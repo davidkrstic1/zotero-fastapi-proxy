@@ -1,5 +1,4 @@
 from fastapi import FastAPI, Response, status
-from fastapi.responses import StreamingResponse
 import requests
 import os
 from dotenv import load_dotenv
@@ -27,14 +26,14 @@ def get_collections():
 @app.get("/attachments/{attachment_key}/download")
 def download_attachment(attachment_key: str):
     url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{attachment_key}/file"
-    response = requests.get(url, headers=HEADERS, stream=True)
+    response = requests.get(url, headers=HEADERS)
     if response.status_code != 200:
         return Response(
             content='{"error": "Download failed"}',
             media_type="application/json",
-            status_code=404  # ← Das ist entscheidend für GPT
+            status_code=404  # GPT-kompatibler Fehlercode
         )
-    return StreamingResponse(response.raw, media_type="application/pdf")
+    return Response(content=response.content, media_type="application/pdf")
 
 @app.get("/items/{item_key}")
 def get_item_details(item_key: str):
@@ -111,4 +110,5 @@ def get_items_in_collection(collection_key: str):
     if response.status_code != 200:
         return {"error": "Zotero API returned an error", "status": response.status_code}
     return response.json()
+
 
