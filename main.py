@@ -1,4 +1,6 @@
 from fastapi import FastAPI, Response, status
+from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 import requests
 import os
 from dotenv import load_dotenv
@@ -11,11 +13,13 @@ ZOTERO_USER_ID = os.getenv("ZOTERO_USER_ID")
 ZOTERO_API_KEY = os.getenv("ZOTERO_API_KEY")
 HEADERS = {"Zotero-API-Key": ZOTERO_API_KEY}
 
+
 @app.get("/items")
 def get_items():
     url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items"
     response = requests.get(url, headers=HEADERS)
     return response.json()
+
 
 @app.get("/collections")
 def get_collections():
@@ -23,17 +27,32 @@ def get_collections():
     response = requests.get(url, headers=HEADERS)
     return response.json()
 
+
 @app.get("/attachments/{attachment_key}/download")
 def download_attachment(attachment_key: str):
     url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{attachment_key}/file"
-    response = requests.get(url, headers=HEADERS)
+    response = requests.get(url, headers=HEADERS, stream=True)
+
     if response.status_code != 200:
         return Response(
             content='{"error": "Download failed"}',
             media_type="application/json",
-            status_code=404  # GPT-kompatibler Fehlercode
+            status_code=404
         )
-    return Response(content=response.content, media_type="application/pdf")
+
+    def cleanup():
+        response.close()
+
+    return StreamingResponse(
+        content=response.raw,
+        media_type="application/pdf",
+        background=BackgroundTask(cleanup),
+        headers={
+            "Content-Disposition": f'attachment; filename="{attachment_key}.pdf"',
+            "Content-Type": "application/pdf"
+        }
+    )
+
 
 @app.get("/items/{item_key}")
 def get_item_details(item_key: str):
@@ -49,6 +68,7 @@ def get_item_details(item_key: str):
         return response.json()
     except Exception as e:
         return {"error": "Request failed", "details": str(e)}
+
 
 @app.get("/items/search")
 def search_items_by_title(title: str):
@@ -71,11 +91,13 @@ def search_items_by_title(title: str):
     except Exception as e:
         return {"error": "Search request failed", "details": str(e)}
 
+
 @app.get("/items/{item_key}/tags")
 def get_tags_for_item(item_key: str):
     url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{item_key}/tags"
     response = requests.get(url, headers=HEADERS)
     return response.json()
+
 
 @app.get("/items/{item_key}/notes")
 def get_notes_for_item(item_key: str):
@@ -83,11 +105,13 @@ def get_notes_for_item(item_key: str):
     response = requests.get(url, headers=HEADERS)
     return response.json()
 
+
 @app.get("/items/{item_key}/attachments")
 def get_attachments_for_item(item_key: str):
     url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{item_key}/children"
     response = requests.get(url, headers=HEADERS)
     return [i for i in response.json() if i.get("data", {}).get("itemType") == "attachment"]
+
 
 @app.get("/item-key-by-title")
 def get_key_by_title(title: str):
@@ -103,6 +127,7 @@ def get_key_by_title(title: str):
 
     return {"error": "No match found"}
 
+
 @app.get("/collections/{collection_key}/items")
 def get_items_in_collection(collection_key: str):
     url = f"https://api.zotero.org/users/{ZOTERO_USER_ID}/collections/{collection_key}/items"
@@ -110,5 +135,3 @@ def get_items_in_collection(collection_key: str):
     if response.status_code != 200:
         return {"error": "Zotero API returned an error", "status": response.status_code}
     return response.json()
-
-
