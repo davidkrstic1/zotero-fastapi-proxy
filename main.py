@@ -11,7 +11,7 @@ from html import escape
 # App
 # =========================
 
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.3.0"
 
 app = FastAPI(
     title="Zotero FastAPI Proxy",
@@ -37,76 +37,33 @@ HEADERS = {"Zotero-API-Key": ZOTERO_API_KEY}
 # =========================
 
 def _get(url: str, params: dict = None) -> requests.Response:
-    try:
-        r = requests.get(url, headers=HEADERS, params=params, timeout=30)
-        r.raise_for_status()
-        return r
-    except requests.HTTPError as e:
-        status = getattr(e.response, "status_code", 500)
-        raise HTTPException(status_code=status, detail=str(e))
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
+    r = requests.get(url, headers=HEADERS, params=params, timeout=30)
+    r.raise_for_status()
+    return r
 
 def _to_str(x):
     return x if isinstance(x, str) and x.strip() else None
 
-def _year(item):
-    d = (item.get("data", {}) or {}).get("date", "")
+def _year(item: Dict[str, Any]) -> str:
+    d = (item.get("data", {}) or {}).get("date", "") or ""
     m = re.search(r"\b(19|20)\d{2}\b", d)
     return m.group(0) if m else ""
 
-def _creator_string(item):
-    creators = (item.get("data", {}) or {}).get("creators", [])
+def _creator_string(item: Dict[str, Any]) -> str:
+    creators = (item.get("data", {}) or {}).get("creators", []) or []
     names = []
     for c in creators:
-        last = c.get("lastName")
-        if last:
-            names.append(last)
+        ln = c.get("lastName")
+        if ln:
+            names.append(ln)
     return ", ".join(names)
 
-def _tags(item):
-    return [t.get("tag", "") for t in (item.get("data", {}) or {}).get("tags", [])]
-
-def _parse_year_from_query(q: str) -> str:
-    if not q:
-        return ""
-    m = re.search(r"\b(19|20)\d{2}\b", q)
-    return m.group(0) if m else ""
-
-def _score_match_free(
-    free: str,
-    item: Dict[str, Any],
-    prefer_year: Optional[str] = None,
-    prefer_creator: Optional[str] = None,
-) -> Tuple[int, str]:
-    data = item.get("data", {}) or {}
-    haystack = " ".join([
-        data.get("title", "") or "",
-        _creator_string(item) or "",
-        data.get("publicationTitle", "") or "",
-        " ".join(_tags(item)) or "",
-    ]).lower()
-
-    free = free or ""
-    tokens = [t for t in free.lower().split() if t]
-    hits = sum(1 for t in tokens if t in haystack)
-
-    score = hits
-    reasons = []
-    if hits:
-        reasons.append(f"token_hits:{hits}")
-    if prefer_year and prefer_year == _year(item):
-        score += 2
-        reasons.append("year_bonus")
-    if prefer_creator and prefer_creator.lower() in (_creator_string(item) or "").lower():
-        score += 2
-        reasons.append("creator_bonus")
-
-    return score, ",".join(reasons) if reasons else "no_match"
+def _tags(item: Dict[str, Any]) -> List[str]:
+    return [t.get("tag", "") for t in ((item.get("data", {}) or {}).get("tags", []) or []) if t.get("tag")]
 
 def _pdf_attachment_keys(item_key: str) -> List[str]:
     r = _get(f"{ZOTERO_BASE}/items/{item_key}/children")
-    pdfs = []
+    pdfs: List[str] = []
     for c in r.json():
         d = c.get("data", {}) or {}
         if d.get("itemType") == "attachment" and d.get("contentType") == "application/pdf":
@@ -138,10 +95,79 @@ def _compact_item(
         "match_reason": match_reason,
     }
 
-def _zotero_items_endpoint(collection_key: Optional[str]) -> str:
-    if collection_key:
-        return f"{ZOTERO_BASE}/collections/{collection_key}/items"
-    return f"{ZOTERO_BASE}/items"
+def _fix_mojibake(s: str) -> str:
+    """
+    Repairs common mojibake where UTF-8 bytes were decoded as latin-1/cp1252.
+    Only attempts repair if typical markers are present.
+    """
+    if not s:
+        return s
+
+    markers = ("Ã", "Â", "â€", "�")
+    if not any(m in s for m in markers):
+        return s
+
+    # Try latin1 -> utf8 repair (most common)
+    try:
+        repaired = s.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
+        return repaired
+    except Exception:
+        pass
+
+    # Fallback: cp1252 -> utf8 repair
+    try:
+        repaired = s.encode("cp1252", errors="strict").decode("utf-8", errors="strict")
+        return repaired
+    except Exception:
+        return s
+
+def _normalize_for_match(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
+
+def _score_biblio_match(
+    title: Optional[str],
+    creator: Optional[str],
+    year: Optional[str],
+    item: Dict[str, Any],
+) -> Tuple[int, str]:
+    data = item.get("data", {}) or {}
+
+    it_title = data.get("title") or ""
+    it_creators = _creator_string(item)
+    it_year = _year(item)
+
+    t = _normalize_for_match(title)
+    c = _normalize_for_match(creator)
+    y = _normalize_for_match(year)
+
+    score = 0
+    reasons = []
+
+    if t:
+        # token-based, but stronger than plain substring:
+        t_tokens = [x for x in re.split(r"\s+", t) if x]
+        hay = _normalize_for_match(it_title)
+        hits = sum(1 for tok in t_tokens if tok in hay)
+        if hits > 0:
+            score += 4 * hits
+            reasons.append("title_match")
+
+    if c:
+        hayc = _normalize_for_match(it_creators)
+        # allow either full creator string or individual surname(s)
+        c_tokens = [x for x in re.split(r"[,\s]+", c) if x]
+        chits = sum(1 for tok in c_tokens if tok and tok in hayc)
+        if chits > 0:
+            score += 3 * chits
+            reasons.append("creator_match")
+
+    if y:
+        if y == _normalize_for_match(it_year):
+            score += 2
+            reasons.append("year_match")
+
+    reason = ",".join(reasons) if reasons else "no_match"
+    return score, reason
 
 # =========================
 # Health
@@ -170,94 +196,7 @@ def list_collections():
     return _get(f"{ZOTERO_BASE}/collections").json()
 
 # =========================
-# SEARCH (broad, library-wide, server-assisted)
-# =========================
-
-@app.get("/search")
-def search(
-    q: Optional[str] = None,
-    collection_key: Optional[str] = None,
-    require_pdf: bool = True,
-    limit: int = 20,
-    max_fetch: int = 500,
-    pdf_check_top_n: int = 100,
-):
-    """
-    Broad search across Zotero items. Uses Zotero server-side q filtering first,
-    then applies a lightweight local scoring (title, creators, publicationTitle, tags).
-    """
-    q = _to_str(q) or ""
-    prefer_year = _parse_year_from_query(q)
-
-    fetched = 0
-    start = 0
-    chunk = 100
-    scored: List[Tuple[int, str, Dict[str, Any]]] = []
-
-    endpoint = _zotero_items_endpoint(collection_key)
-
-    # 1) Fetch candidates from Zotero with q (fast prefilter)
-    while fetched < max_fetch:
-        params = {
-            "limit": min(chunk, max_fetch - fetched),
-            "start": start,
-            "itemType": "-attachment",
-        }
-        if q:
-            params["q"] = q
-            params["qmode"] = "everything"
-
-        batch = _get(endpoint, params=params).json()
-        if not batch:
-            break
-
-        for it in batch:
-            score, reason = _score_match_free(q, it, prefer_year=prefer_year)
-            if score > 0:
-                scored.append((score, reason, it))
-
-        fetched += len(batch)
-        start += len(batch)
-
-        # Wenn Zotero serverseitig q filtert, sind die Treffer oft schon „eng genug“.
-        # Wir holen trotzdem bis max_fetch, damit „Autor only“ oder „Titel only“ robust bleibt.
-        if q and len(batch) < chunk:
-            break
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    # 2) Optional PDF check für Top-N Kandidaten, um Attachment Keys direkt zu liefern
-    results: List[Dict[str, Any]] = []
-    checked = 0
-
-    for score, reason, it in scored:
-        if require_pdf and checked >= pdf_check_top_n:
-            break
-
-        item_key = (it.get("data", {}) or {}).get("key")
-        if not item_key:
-            continue
-
-        pdfs: List[str] = _pdf_attachment_keys(item_key) if require_pdf else []
-        checked += 1
-
-        if require_pdf and not pdfs:
-            continue
-
-        results.append(_compact_item(it, bool(pdfs), pdfs, reason, score))
-        if len(results) >= limit:
-            break
-
-    return {
-        "query": q,
-        "collection_key": collection_key,
-        "server_fetched": fetched,
-        "pdf_checked": checked,
-        "results": results,
-    }
-
-# =========================
-# RESOLVE (structured bibliographic)
+# RESOLVE (bibliographic)
 # =========================
 
 @app.get("/resolve-biblio")
@@ -272,29 +211,68 @@ def resolve_biblio(
     pdf_check_top_n: int = 50,
 ):
     """
-    Resolve bibliographic hints (title, creator, year) to concrete Zotero items.
-    Uses /search internally for consistent behavior.
+    Fast bibliographic resolver:
+    - Pulls up to max_fetch items from Zotero (server-side paging)
+    - Scores by title / creator / year
+    - Optionally filters to items that actually have at least one PDF attachment
     """
-    parts = []
-    if title:
-        parts.append(title)
-    if creator:
-        parts.append(creator)
-    if year:
-        parts.append(year)
+    title = _to_str(title)
+    creator = _to_str(creator)
+    year = _to_str(year)
+    collection_key = _to_str(collection_key)
 
-    query = " ".join([p for p in parts if p]).strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="Provide at least one of title, creator, year")
+    if not any([title, creator, year]):
+        raise HTTPException(status_code=400, detail="Provide at least one of: title, creator, year")
 
-    res = search(
-        q=query,
-        collection_key=collection_key,
-        require_pdf=require_pdf,
-        limit=limit,
-        max_fetch=max_fetch,
-        pdf_check_top_n=pdf_check_top_n,
-    )
+    fetched = 0
+    start = 0
+    chunk = 100
+    scored: List[Tuple[int, str, Dict[str, Any]]] = []
+
+    while fetched < max_fetch:
+        params = {"limit": chunk, "start": start, "itemType": "-attachment"}
+        if collection_key:
+            r = _get(f"{ZOTERO_BASE}/collections/{collection_key}/items", params=params)
+        else:
+            r = _get(f"{ZOTERO_BASE}/items", params=params)
+
+        batch = r.json()
+        if not batch:
+            break
+
+        for it in batch:
+            s, reason = _score_biblio_match(title, creator, year, it)
+            if s > 0:
+                scored.append((s, reason, it))
+
+        fetched += len(batch)
+        start += chunk
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    results: List[Dict[str, Any]] = []
+    pdf_checked = 0
+
+    for s, reason, it in scored:
+        if len(results) >= limit:
+            break
+
+        key = (it.get("data", {}) or {}).get("key")
+        if not key:
+            continue
+
+        pdfs: List[str] = []
+        if require_pdf:
+            if pdf_checked >= pdf_check_top_n and results:
+                # we already found enough good matches; stop spending time on PDF checks
+                break
+            pdfs = _pdf_attachment_keys(key)
+            pdf_checked += 1
+            if not pdfs:
+                continue
+
+        results.append(_compact_item(it, bool(pdfs), pdfs, reason, s))
+
     return {
         "query": {
             "title": title,
@@ -302,9 +280,9 @@ def resolve_biblio(
             "year": year,
             "collection_key": collection_key,
         },
-        "server_fetched": res.get("server_fetched"),
-        "pdf_checked": res.get("pdf_checked"),
-        "results": res.get("results"),
+        "server_fetched": fetched,
+        "pdf_checked": pdf_checked,
+        "results": results,
     }
 
 # =========================
@@ -314,11 +292,16 @@ def resolve_biblio(
 @app.get("/attachments/{attachment_key}/html", response_class=HTMLResponse)
 def pdf_as_html(attachment_key: str):
     r = _get(f"{ZOTERO_BASE}/items/{attachment_key}/file")
-    doc = fitz.open(stream=r.content, filetype="pdf")
+    try:
+        doc = fitz.open(stream=r.content, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Unable to open PDF: {e}")
 
     parts = ["<html><head><meta charset='utf-8'></head><body>"]
     for page in doc:
-        parts.append(f"<p>{escape(page.get_text())}</p>")
+        txt = page.get_text() or ""
+        txt = _fix_mojibake(txt)
+        parts.append(f"<p>{escape(txt)}</p>")
     parts.append("</body></html>")
 
     html = "".join(parts)
@@ -331,26 +314,28 @@ def pdf_as_html(attachment_key: str):
 @app.get("/attachments/{attachment_key}/search")
 def pdf_search(
     attachment_key: str,
-    phrase: str = Query(..., min_length=1),
-    max_hits: int = 20,
-    snippet_chars: int = 1200,
+    phrase: str,
+    max_hits: int = 10,
+    snippet_chars: int = 1000,
 ):
-    """
-    Search for a phrase inside a PDF attachment.
-    Returns page numbers and a snippet from the page text.
-    """
     r = _get(f"{ZOTERO_BASE}/items/{attachment_key}/file")
-    doc = fitz.open(stream=r.content, filetype="pdf")
+    try:
+        doc = fitz.open(stream=r.content, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Unable to open PDF: {e}")
 
-    phrase_l = phrase.lower()
-    hits = []
+    phrase_l = (phrase or "").lower().strip()
+    if not phrase_l:
+        raise HTTPException(status_code=400, detail="phrase must be a non-empty string")
 
+    hits: List[Dict[str, Any]] = []
     for i, page in enumerate(doc):
         text = page.get_text() or ""
-        if phrase_l in text.lower():
+        text_fixed = _fix_mojibake(text)
+        if phrase_l in text_fixed.lower():
             hits.append({
                 "page": i + 1,
-                "snippet": text[:snippet_chars]
+                "snippet": text_fixed[:snippet_chars]
             })
             if len(hits) >= max_hits:
                 break
