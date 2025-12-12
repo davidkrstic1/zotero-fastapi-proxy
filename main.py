@@ -12,7 +12,7 @@ from html import escape
 # App
 # =========================
 
-APP_VERSION = "2.3.6"
+APP_VERSION = "2.3.7"
 
 app = FastAPI(
     title="Zotero FastAPI Proxy",
@@ -38,9 +38,30 @@ HEADERS = {"Zotero-API-Key": ZOTERO_API_KEY}
 # =========================
 
 def _get(url: str, params: dict = None) -> requests.Response:
-    r = requests.get(url, headers=HEADERS, params=params, timeout=45)
-    r.raise_for_status()
-    return r
+    # NEW: lightweight retries for transient issues (timeouts, 502/503/504, connection resets).
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, params=params, timeout=45)
+            r.raise_for_status()
+            return r
+        except requests.exceptions.HTTPError as e:
+            last_exc = e
+            status = getattr(e.response, "status_code", None)
+            if status in (502, 503, 504) and attempt < 2:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            raise
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            raise
+    # Should never reach here
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unexpected _get failure")
 
 def _to_str(x) -> Optional[str]:
     return x.strip() if isinstance(x, str) and x.strip() else None
@@ -245,6 +266,48 @@ def _zotero_server_search_items(
 
     return items[:limit], fetched
 
+# NEW: fallback scan if server-side q-search yields no candidates
+def _zotero_fallback_scan_items(
+    title: Optional[str],
+    creator: Optional[str],
+    year: Optional[str],
+    collection_key: Optional[str],
+    max_scan: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    scanned = 0
+    start = 0
+    chunk = 100
+    scored: List[Tuple[int, str, Dict[str, Any]]] = []
+
+    while scanned < max_scan:
+        params = {
+            "limit": min(chunk, max_scan - scanned),
+            "start": start,
+            "itemType": "-attachment",
+        }
+        if collection_key:
+            r = _get(f"{ZOTERO_BASE}/collections/{collection_key}/items", params=params)
+        else:
+            r = _get(f"{ZOTERO_BASE}/items", params=params)
+
+        batch = r.json()
+        if not batch:
+            break
+
+        for it in batch:
+            s, reason = _score_match_biblio(title, creator, year, it)
+            if s > 0:
+                scored.append((s, reason, it))
+
+        scanned += len(batch)
+        start += len(batch)
+
+        if len(batch) < params["limit"]:
+            break
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [it for _, _, it in scored], scanned
+
 # =========================
 # Very small in-memory cache for resolve-biblio
 # =========================
@@ -252,7 +315,8 @@ def _zotero_server_search_items(
 _RESOLVE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _RESOLVE_TTL_SECONDS = 15 * 60
 
-def _cache_key(title, creator, year, collection_key, limit, max_fetch, require_pdf) -> str:
+def _cache_key(title, creator, year, collection_key, limit, max_fetch, require_pdf, pdf_check_top_n) -> str:
+    # NEW: include pdf_check_top_n to avoid mismatching cached responses across different settings
     return "|".join([
         title or "",
         creator or "",
@@ -261,6 +325,7 @@ def _cache_key(title, creator, year, collection_key, limit, max_fetch, require_p
         str(limit),
         str(max_fetch),
         "pdf1" if require_pdf else "pdf0",
+        str(pdf_check_top_n),
     ])
 
 def _cache_get(key: str) -> Optional[Dict[str, Any]]:
@@ -326,7 +391,7 @@ def resolve_biblio(
     if year and not re.fullmatch(r"(19|20)\d{2}", year):
         raise HTTPException(status_code=400, detail="year must be a 4-digit year like 2023")
 
-    cache_k = _cache_key(title, creator, year, collection_key, limit, max_fetch, require_pdf)
+    cache_k = _cache_key(title, creator, year, collection_key, limit, max_fetch, require_pdf, pdf_check_top_n)
     cached = _cache_get(cache_k)
     if cached:
         return cached
@@ -340,6 +405,18 @@ def resolve_biblio(
         limit=max_fetch,
         max_fetch=max_fetch,
     )
+
+    # NEW: if Zotero q-search yields nothing, fall back to scanning items and scoring locally
+    if not candidates:
+        fallback_candidates, scanned = _zotero_fallback_scan_items(
+            title=title,
+            creator=creator,
+            year=year,
+            collection_key=collection_key,
+            max_scan=max_fetch,
+        )
+        candidates = fallback_candidates
+        fetched = scanned  # keep type stable: still an int, now representing scanned items
 
     scored: List[Tuple[int, str, Dict[str, Any]]] = []
     for it in candidates:
