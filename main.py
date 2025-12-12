@@ -1,13 +1,12 @@
 import os
 import re
-import json
 import time
 import html as _html
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import fitz  # PyMuPDF
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from dotenv import load_dotenv
 
@@ -22,7 +21,7 @@ if not ZOTERO_API_KEY or not ZOTERO_USER_ID:
 ZOTERO_API = "https://api.zotero.org"
 HEADERS = {"Zotero-API-Key": ZOTERO_API_KEY}
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 
 CACHE_MAX_ITEMS = int(os.getenv("CACHE_MAX_ITEMS", "32"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
@@ -49,7 +48,6 @@ class _Cache:
         if now - ts > self.ttl:
             self.delete(key)
             return None
-        # mark as recently used
         if key in self._order:
             self._order.remove(key)
         self._order.append(key)
@@ -158,7 +156,7 @@ def _compact_item(
         "pdf_attachment_keys": pdf_keys or [],
         "note_snippet": note_snippet,
         "match_reason": match_reason,
-        "score": score if score is not None else 0,
+        "score": int(score or 0),
     }
 
 
@@ -169,11 +167,7 @@ def _score_match_free(
     prefer_year: Optional[str] = None,
     prefer_creator: Optional[str] = None,
 ) -> Tuple[int, str]:
-    """
-    Heuristic scoring based on title, creators, tags, publication, year, and optional note text.
-    This is not embeddings, but it is robust enough to avoid the "last added only" trap.
-    """
-    qn = q.strip().lower()
+    qn = (q or "").strip().lower()
     if not qn:
         return 0, ""
 
@@ -230,6 +224,14 @@ def _get_children(item_key: str) -> List[Dict[str, Any]]:
     return r.json()
 
 
+def _notes_to_plain_text(note_html: str) -> str:
+    t = re.sub(r"<br\s*/?>", "\n", note_html or "", flags=re.IGNORECASE)
+    t = re.sub(r"</p\s*>", "\n", t, flags=re.IGNORECASE)
+    t = re.sub(r"<[^>]+>", "", t)
+    t = _html.unescape(t)
+    return t.strip()
+
+
 def _get_notes_for_item(item_key: str) -> List[Dict[str, Any]]:
     children = _get_children(item_key)
     notes: List[Dict[str, Any]] = []
@@ -238,15 +240,6 @@ def _get_notes_for_item(item_key: str) -> List[Dict[str, Any]]:
         if data.get("itemType") == "note":
             notes.append({"note_key": data.get("key") or c.get("key"), "note_html": data.get("note", "")})
     return notes
-
-
-def _notes_to_plain_text(note_html: str) -> str:
-    # Zotero notes are HTML. Strip tags very roughly.
-    t = re.sub(r"<br\s*/?>", "\n", note_html, flags=re.IGNORECASE)
-    t = re.sub(r"</p\s*>", "\n", t, flags=re.IGNORECASE)
-    t = re.sub(r"<[^>]+>", "", t)
-    t = _html.unescape(t)
-    return t.strip()
 
 
 def _get_pdf_attachments(item_key: str) -> List[Dict[str, Any]]:
@@ -275,7 +268,6 @@ def _choose_primary_pdf(item_key: str) -> Optional[str]:
     if not pdfs:
         return None
 
-    # Heuristic: choose the largest enclosure length if present, else first.
     best_key = None
     best_len = -1
     for p in pdfs:
@@ -290,9 +282,8 @@ def _choose_primary_pdf(item_key: str) -> Optional[str]:
         d = p.get("data", {}) or {}
         filename = (d.get("filename") or "").lower()
 
-        # small preference: avoid generic "pdf" titles if multiple exist
         bonus = 0
-        if filename and filename != "pdf" and "beck" in filename:
+        if filename and filename != "pdf":
             bonus += 1
 
         if ln + bonus > best_len:
@@ -364,10 +355,7 @@ def _pdf_find_phrase(
     context_chars: int,
     use_cache: bool,
 ) -> Dict[str, Any]:
-    # For speed, do a two-step approach:
-    # 1) extract text up to max_pages
-    # 2) locate occurrences and also attempt to infer page indices using PyMuPDF search_for
-    phrase_clean = phrase.strip()
+    phrase_clean = (phrase or "").strip()
     if not phrase_clean:
         return {"phrase": phrase, "hits": []}
 
@@ -380,32 +368,25 @@ def _pdf_find_phrase(
     total_pages = len(doc)
     pages_to_scan = min(total_pages, max_pages)
 
-    # Cache the page text slice for scanning (coarse cache)
     coarse_cache_key = f"pdfcoarse:{attachment_key}:1:{pages_to_scan}"
     coarse_text = _pdf_text_cache.get(coarse_cache_key) if use_cache else None
     if coarse_text is None:
         texts: List[str] = []
         for i in range(pages_to_scan):
-            t = doc[i].get_text() or ""
-            texts.append(t)
+            texts.append(doc[i].get_text() or "")
         coarse_text = "\n\n".join(texts)
         if use_cache:
             _pdf_text_cache.set(coarse_cache_key, coarse_text)
 
     hits: List[Dict[str, Any]] = []
-
-    # Find occurrences in coarse text for context
     for m in re.finditer(re.escape(phrase_clean), coarse_text, flags=re.IGNORECASE):
         if len(hits) >= max_hits:
             break
         start = max(0, m.start() - context_chars)
         end = min(len(coarse_text), m.end() + context_chars)
         context = coarse_text[start:end].strip()
-
         hits.append({"context": context, "page": None})
 
-    # Try to enrich hits with page numbers using page.search_for (best effort).
-    # This is more expensive, so only if we found any hits.
     if hits:
         enriched = 0
         for pidx in range(pages_to_scan):
@@ -413,8 +394,6 @@ def _pdf_find_phrase(
                 break
             rects = doc[pidx].search_for(phrase_clean, quads=False)
             if rects:
-                # Assign page number to as many hits as we have rects.
-                # This is heuristic, but usually enough for citations.
                 for _ in rects:
                     if enriched >= len(hits):
                         break
@@ -430,13 +409,18 @@ def _parse_year_from_query(q: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+def _to_str(x: Optional[str]) -> Optional[str]:
+    if x is None:
+        return None
+    return str(x)
+
+
 # ---------------------------
-# Core API
+# API
 # ---------------------------
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    # lightweight auth check
     url = f"{ZOTERO_API}/users/{ZOTERO_USER_ID}/collections"
     r = zotero_get(url)
     ok = r.status_code == 200
@@ -450,8 +434,8 @@ def health() -> Dict[str, Any]:
 
 
 @app.get("/library/stats")
-def library_stats(max_scan: int = Query(default=400, ge=50, le=3000)) -> Dict[str, Any]:
-    # scan top-level items in chunks and compute rough stats
+def library_stats(max_scan: int = 400) -> Dict[str, Any]:
+    max_scan = max(50, min(3000, int(max_scan)))
     chunk = 100
     scanned = 0
     start = 0
@@ -483,7 +467,7 @@ def library_stats(max_scan: int = Query(default=400, ge=50, le=3000)) -> Dict[st
 
 
 @app.get("/collections")
-def list_collections(include_deleted: bool = Query(default=False)) -> List[Dict[str, Any]]:
+def list_collections(include_deleted: bool = False) -> List[Dict[str, Any]]:
     url = f"{ZOTERO_API}/users/{ZOTERO_USER_ID}/collections"
     r = zotero_get(url)
     if r.status_code != 200:
@@ -495,19 +479,19 @@ def list_collections(include_deleted: bool = Query(default=False)) -> List[Dict[
 
 
 @app.get("/collections/search")
-def search_collections(q: str = Query(..., min_length=1), include_deleted: bool = Query(default=False)) -> Dict[str, Any]:
+def search_collections(q: str, include_deleted: bool = False) -> Dict[str, Any]:
     cols = list_collections(include_deleted=include_deleted)
-    qn = q.lower().strip()
+    qn = (q or "").lower().strip()
     hits = []
     for c in cols:
         name = ((c.get("data", {}) or {}).get("name") or "").lower()
-        if qn in name:
+        if qn and qn in name:
             hits.append({"collection_key": (c.get("data", {}) or {}).get("key") or c.get("key"), "name": (c.get("data", {}) or {}).get("name")})
     return {"query": q, "results": hits}
 
 
 @app.get("/collections/tree")
-def collections_tree(include_deleted: bool = Query(default=False)) -> Dict[str, Any]:
+def collections_tree(include_deleted: bool = False) -> Dict[str, Any]:
     cols = list_collections(include_deleted=include_deleted)
     nodes: Dict[str, Dict[str, Any]] = {}
     roots: List[Dict[str, Any]] = []
@@ -530,12 +514,14 @@ def collections_tree(include_deleted: bool = Query(default=False)) -> Dict[str, 
 @app.get("/collections/{collection_key}/items")
 def list_items_in_collection(
     collection_key: str,
-    limit: int = Query(default=50, ge=1, le=100),
-    start: int = Query(default=0, ge=0),
-    sort: str = Query(default="dateModified"),
-    direction: str = Query(default="desc"),
-    top: bool = Query(default=True),
+    limit: int = 50,
+    start: int = 0,
+    sort: str = "dateModified",
+    direction: str = "desc",
+    top: bool = True,
 ) -> List[Dict[str, Any]]:
+    limit = max(1, min(100, int(limit)))
+    start = max(0, int(start))
     url = f"{ZOTERO_API}/users/{ZOTERO_USER_ID}/collections/{collection_key}/items"
     params = {"limit": limit, "start": start, "sort": sort, "direction": direction}
     r = zotero_get(url, params=params)
@@ -549,12 +535,14 @@ def list_items_in_collection(
 
 @app.get("/items")
 def list_items(
-    limit: int = Query(default=50, ge=1, le=100),
-    start: int = Query(default=0, ge=0),
-    sort: str = Query(default="dateModified"),
-    direction: str = Query(default="desc"),
-    top: bool = Query(default=True),
+    limit: int = 50,
+    start: int = 0,
+    sort: str = "dateModified",
+    direction: str = "desc",
+    top: bool = True,
 ) -> List[Dict[str, Any]]:
+    limit = max(1, min(100, int(limit)))
+    start = max(0, int(start))
     url = f"{ZOTERO_API}/users/{ZOTERO_USER_ID}/items"
     params = {"limit": limit, "start": start, "sort": sort, "direction": direction}
     r = zotero_get(url, params=params)
@@ -600,31 +588,35 @@ def get_primary_pdf(item_key: str) -> Dict[str, Any]:
 
 
 @app.post("/items/batch")
-def batch_items(item_keys: List[str] = Body(..., embed=True)) -> Dict[str, Any]:
-    # Retrieve compact profiles for multiple items (best effort).
+def batch_items(payload: Dict[str, Any]) -> Dict[str, Any]:
+    item_keys = payload.get("item_keys") or []
+    if not isinstance(item_keys, list):
+        raise HTTPException(status_code=400, detail="item_keys must be a list of strings")
     results = []
     for k in item_keys[:50]:
         try:
-            it = get_item_details(k)
-            pdfs = _pdf_attachment_keys(k)
-            notes = _get_notes_for_item(k)
+            it = get_item_details(str(k))
+            pdfs = _pdf_attachment_keys(str(k))
+            notes = _get_notes_for_item(str(k))
             note_plain = ""
             if notes:
                 note_plain = _notes_to_plain_text(notes[0].get("note_html", ""))[:400]
             results.append(_compact_item(it, has_pdf=bool(pdfs), pdf_keys=pdfs, note_snippet=note_plain))
         except Exception:
-            results.append({"item_key": k, "error": "Failed to fetch item"})
+            results.append({"item_key": str(k), "error": "Failed to fetch item"})
     return {"count": len(results), "results": results}
 
 
 @app.get("/notes/search")
-def search_notes(q: str = Query(..., min_length=2), limit: int = Query(default=20, ge=1, le=50), max_scan: int = Query(default=800, ge=100, le=5000)) -> Dict[str, Any]:
-    # Scan top-level items and search through their notes.
+def search_notes(q: str, limit: int = 20, max_scan: int = 800) -> Dict[str, Any]:
+    limit = max(1, min(50, int(limit)))
+    max_scan = max(100, min(5000, int(max_scan)))
+
     chunk = 100
     scanned = 0
     start = 0
     hits = []
-    qn = q.lower().strip()
+    qn = (q or "").lower().strip()
 
     while scanned < max_scan and len(hits) < limit:
         batch = list_items(limit=chunk, start=start, top=True)
@@ -637,8 +629,9 @@ def search_notes(q: str = Query(..., min_length=2), limit: int = Query(default=2
             notes = _get_notes_for_item(key)
             for n in notes:
                 plain = _notes_to_plain_text(n.get("note_html", ""))
-                if qn in plain.lower():
-                    snippet_start = max(0, plain.lower().find(qn) - 120)
+                if qn and qn in plain.lower():
+                    idx = plain.lower().find(qn)
+                    snippet_start = max(0, idx - 120)
                     snippet_end = min(len(plain), snippet_start + 320)
                     snippet = plain[snippet_start:snippet_end].strip()
                     hits.append(
@@ -662,24 +655,30 @@ def search_notes(q: str = Query(..., min_length=2), limit: int = Query(default=2
 
 @app.get("/search")
 def faceted_search(
-    q: Optional[str] = Query(default=None),
-    title: Optional[str] = Query(default=None),
-    creator: Optional[str] = Query(default=None),
-    tag: Optional[str] = Query(default=None),
-    year: Optional[str] = Query(default=None),
-    collection_key: Optional[str] = Query(default=None),
-    itemType: Optional[str] = Query(default=None),
-    has_pdf: bool = Query(default=True),
-    has_notes: bool = Query(default=False),
-    limit: int = Query(default=20, ge=1, le=50),
-    max_scan: int = Query(default=1600, ge=100, le=10000),
+    q: Optional[str] = None,
+    title: Optional[str] = None,
+    creator: Optional[str] = None,
+    tag: Optional[str] = None,
+    year: Optional[str] = None,
+    collection_key: Optional[str] = None,
+    itemType: Optional[str] = None,
+    has_pdf: bool = True,
+    has_notes: bool = False,
+    limit: int = 20,
+    max_scan: int = 1600,
 ) -> Dict[str, Any]:
-    """
-    Library-wide faceted search with scan-based retrieval.
-    It is designed for GPT navigation and returns compact item profiles.
-    """
-    # Build a combined free query string for scoring
-    free = " ".join([x for x in [q, title, creator, tag, year] if x])
+    limit = max(1, min(50, int(limit)))
+    max_scan = max(100, min(10000, int(max_scan)))
+
+    q = _to_str(q)
+    title = _to_str(title)
+    creator = _to_str(creator)
+    tag = _to_str(tag)
+    year = _to_str(year)
+    itemType = _to_str(itemType)
+    collection_key = _to_str(collection_key)
+
+    free = " ".join([x for x in [q, title, creator, tag, year] if isinstance(x, str) and x.strip()])
     prefer_year = year or _parse_year_from_query(free)
     prefer_creator = creator
 
@@ -687,7 +686,7 @@ def faceted_search(
     scanned = 0
     start = 0
 
-    candidates: List[Tuple[int, str, Dict[str, Any], str]] = []
+    candidates: List[Tuple[int, str, Dict[str, Any], str, List[str]]] = []
 
     while scanned < max_scan:
         if collection_key:
@@ -722,23 +721,25 @@ def faceted_search(
             if not key:
                 continue
 
-            notes = _get_notes_for_item(key) if has_notes else []
             note_plain = ""
-            if notes:
-                note_plain = _notes_to_plain_text(notes[0].get("note_html", ""))
+            if has_notes:
+                notes = _get_notes_for_item(key)
+                if notes:
+                    note_plain = _notes_to_plain_text(notes[0].get("note_html", ""))
 
-            pdf_keys = _pdf_attachment_keys(key)
-            if has_pdf and not pdf_keys:
-                continue
+            pdf_keys: List[str] = []
+            if has_pdf:
+                pdf_keys = _pdf_attachment_keys(key)
+                if not pdf_keys:
+                    continue
 
             if free:
                 score, reason = _score_match_free(free, it, note_text=note_plain, prefer_year=prefer_year, prefer_creator=prefer_creator)
                 if score <= 0:
                     continue
-                candidates.append((score, reason, it, note_plain[:400]))
+                candidates.append((score, reason, it, note_plain[:400], pdf_keys))
             else:
-                # if no free query, accept by filters only
-                candidates.append((1, "filters_only", it, note_plain[:400]))
+                candidates.append((1, "filters_only", it, note_plain[:400], pdf_keys))
 
         scanned += len(batch)
         start += chunk
@@ -746,12 +747,7 @@ def faceted_search(
     candidates.sort(key=lambda x: (x[0], (x[2].get("data", {}) or {}).get("title", "")), reverse=True)
 
     results = []
-    for score, reason, it, note_snip in candidates[: limit * 3]:
-        data = it.get("data", {}) or {}
-        key = data.get("key") or it.get("key")
-        pdf_keys = _pdf_attachment_keys(key) if key else []
-        if has_pdf and not pdf_keys:
-            continue
+    for score, reason, it, note_snip, pdf_keys in candidates[: limit * 4]:
         results.append(_compact_item(it, has_pdf=bool(pdf_keys), pdf_keys=pdf_keys, note_snippet=note_snip, match_reason=reason, score=score))
         if len(results) >= limit:
             break
@@ -761,18 +757,17 @@ def faceted_search(
 
 @app.get("/resolve")
 def resolve(
-    query: str = Query(..., min_length=2),
-    limit: int = Query(default=5, ge=1, le=10),
-    collection_key: Optional[str] = Query(default=None),
-    has_pdf: bool = Query(default=True),
-    max_scan: int = Query(default=2000, ge=100, le=10000),
+    query: str,
+    limit: int = 5,
+    collection_key: Optional[str] = None,
+    has_pdf: bool = True,
+    max_scan: int = 2000,
 ) -> Dict[str, Any]:
-    """
-    Resolve a natural-language reference to best matching Zotero items.
-    Returns top candidates with confidence-like scoring.
-    """
+    limit = max(1, min(10, int(limit)))
+    max_scan = max(100, min(10000, int(max_scan)))
+
     prefer_year = _parse_year_from_query(query)
-    # crude creator hint: first capitalized token that looks like surname is not reliable, so do not parse aggressively.
+
     res = faceted_search(
         q=query,
         collection_key=collection_key,
@@ -782,12 +777,8 @@ def resolve(
         max_scan=max_scan,
     )
 
-    results = res.get("results", [])[:limit]
-    # add simple confidence band
-    if results:
-        best_score = results[0].get("score", 0) or 0
-    else:
-        best_score = 0
+    candidates = (res.get("results", []) or [])[:limit]
+    best_score = int(candidates[0].get("score", 0)) if candidates else 0
 
     def band(s: int) -> str:
         if s >= 20:
@@ -798,11 +789,11 @@ def resolve(
             return "low"
         return "very_low"
 
-    for r in results:
-        r["confidence"] = band(int(r.get("score", 0) or 0))
-        r["preferred_year_hint"] = prefer_year or ""
+    for c in candidates:
+        c["confidence"] = band(int(c.get("score", 0) or 0))
+        c["preferred_year_hint"] = prefer_year or ""
 
-    return {"query": query, "best_score": best_score, "candidates": results}
+    return {"query": query, "best_score": best_score, "candidates": candidates}
 
 
 # ---------------------------
@@ -812,24 +803,24 @@ def resolve(
 @app.get("/attachments/{attachment_key}/text", response_class=PlainTextResponse)
 def get_pdf_text_plain(
     attachment_key: str,
-    page_from: int = Query(default=1, ge=1),
-    page_to: int = Query(default=50, ge=1),
-    max_chars: int = Query(default=400000, ge=1000, le=2000000),
-    use_cache: bool = Query(default=True),
+    page_from: int = 1,
+    page_to: int = 50,
+    max_chars: int = 400000,
+    use_cache: bool = True,
 ) -> PlainTextResponse:
-    txt = _pdf_to_text_by_pages(attachment_key, page_from, page_to, max_chars, use_cache)
+    txt = _pdf_to_text_by_pages(attachment_key, int(page_from), int(page_to), int(max_chars), bool(use_cache))
     return PlainTextResponse(txt)
 
 
 @app.get("/attachments/{attachment_key}/html", response_class=HTMLResponse)
 def get_pdf_text_as_html(
     attachment_key: str,
-    page_from: int = Query(default=1, ge=1),
-    page_to: int = Query(default=50, ge=1),
-    max_chars: int = Query(default=400000, ge=1000, le=2000000),
-    use_cache: bool = Query(default=True),
+    page_from: int = 1,
+    page_to: int = 50,
+    max_chars: int = 400000,
+    use_cache: bool = True,
 ) -> HTMLResponse:
-    txt = _pdf_to_text_by_pages(attachment_key, page_from, page_to, max_chars, use_cache)
+    txt = _pdf_to_text_by_pages(attachment_key, int(page_from), int(page_to), int(max_chars), bool(use_cache))
     safe = _html.escape(txt).replace("\n", "<br/>")
     page = (
         "<html><body>"
@@ -844,22 +835,22 @@ def get_pdf_text_as_html(
 @app.get("/attachments/{attachment_key}/extract", response_class=PlainTextResponse)
 def extract_pdf_range(
     attachment_key: str,
-    page_from: int = Query(..., ge=1),
-    page_to: int = Query(..., ge=1),
-    max_chars: int = Query(default=250000, ge=1000, le=2000000),
-    use_cache: bool = Query(default=True),
+    page_from: int,
+    page_to: int,
+    max_chars: int = 250000,
+    use_cache: bool = True,
 ) -> PlainTextResponse:
-    txt = _pdf_to_text_by_pages(attachment_key, page_from, page_to, max_chars, use_cache)
+    txt = _pdf_to_text_by_pages(attachment_key, int(page_from), int(page_to), int(max_chars), bool(use_cache))
     return PlainTextResponse(txt)
 
 
 @app.get("/attachments/{attachment_key}/search")
 def search_in_pdf(
     attachment_key: str,
-    phrase: str = Query(..., min_length=2),
-    max_pages: int = Query(default=120, ge=1, le=800),
-    max_hits: int = Query(default=20, ge=1, le=50),
-    context_chars: int = Query(default=160, ge=40, le=600),
-    use_cache: bool = Query(default=True),
+    phrase: str,
+    max_pages: int = 120,
+    max_hits: int = 20,
+    context_chars: int = 160,
+    use_cache: bool = True,
 ) -> Dict[str, Any]:
-    return _pdf_find_phrase(attachment_key, phrase, max_pages, max_hits, context_chars, use_cache)
+    return _pdf_find_phrase(attachment_key, phrase, int(max_pages), int(max_hits), int(context_chars), bool(use_cache))
