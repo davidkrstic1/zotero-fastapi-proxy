@@ -13,7 +13,7 @@ import unicodedata
 # App
 # =========================
 
-APP_VERSION = "2.3.2"
+APP_VERSION = "2.3.3"
 
 app = FastAPI(
     title="Zotero FastAPI Proxy",
@@ -197,23 +197,38 @@ _MOJIBAKE_SIGNALS = ("Â", "Ã", "â€", "â€“", "â€”", "â€ž", "â
 
 def _maybe_fix_mojibake(s: str) -> str:
     """
-    Heuristic: if a string looks like UTF-8 bytes mis-decoded as latin-1,
-    try latin-1 -> utf-8 re-decode.
-    Example: "Ã¶" -> "ö", "Â©" -> "©".
+    Heuristic repair for common mojibake in PDF extracted text.
+    Important: try cp1252 -> utf-8 first (handles '€' etc), then latin-1 -> utf-8.
     """
     if not s:
         return s
     if not any(sig in s for sig in _MOJIBAKE_SIGNALS):
         return s
-    try:
-        candidate = s.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
-    except Exception:
-        return s
 
-    # Accept candidate only if it reduces mojibake signals noticeably
     old_bad = sum(s.count(sig) for sig in _MOJIBAKE_SIGNALS)
-    new_bad = sum(candidate.count(sig) for sig in _MOJIBAKE_SIGNALS)
-    return candidate if new_bad < old_bad else s
+
+    # 1) Try cp1252 -> utf-8
+    for enc in ("cp1252", "latin-1"):
+        try:
+            candidate = s.encode(enc, errors="strict").decode("utf-8", errors="strict")
+        except Exception:
+            continue
+
+        new_bad = sum(candidate.count(sig) for sig in _MOJIBAKE_SIGNALS)
+        if new_bad < old_bad:
+            return candidate
+
+    # 2) As a last resort, try a permissive pass (never worse than current; may help partially)
+    for enc in ("cp1252", "latin-1"):
+        try:
+            candidate = s.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        new_bad = sum(candidate.count(sig) for sig in _MOJIBAKE_SIGNALS)
+        if new_bad < old_bad:
+            return candidate
+
+    return s
 
 def _clean_text(s: str) -> str:
     if not isinstance(s, str):
@@ -221,19 +236,13 @@ def _clean_text(s: str) -> str:
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = unicodedata.normalize("NFC", s)
     s = _maybe_fix_mojibake(s)
-    # Normalize again after potential re-decode
     s = unicodedata.normalize("NFC", s)
     return s
 
 def _page_text(page: fitz.Page) -> str:
-    # Using "text" is fine; we just normalize and repair typical mojibake patterns
     return _clean_text(page.get_text())
 
 def _snippet_around(text: str, phrase: str, radius: int = 600) -> str:
-    """
-    Return a snippet around the first match (case-insensitive).
-    Falls back to the beginning if match index can't be found.
-    """
     if not text:
         return ""
     if not phrase:
@@ -416,7 +425,7 @@ def pdf_as_html(attachment_key: str):
     return HTMLResponse(content=html, media_type="text/html; charset=utf-8")
 
 # =========================
-# PDF SEARCH (now uses the same cleaned text path as HTML)
+# PDF SEARCH
 # =========================
 
 @app.get("/attachments/{attachment_key}/search")
