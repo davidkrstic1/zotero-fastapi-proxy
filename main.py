@@ -13,7 +13,7 @@ import unicodedata
 # App
 # =========================
 
-APP_VERSION = "2.3.3"
+APP_VERSION = "2.3.4"
 
 app = FastAPI(
     title="Zotero FastAPI Proxy",
@@ -195,39 +195,80 @@ def _zotero_server_search_items(
 
 _MOJIBAKE_SIGNALS = ("Â", "Ã", "â€", "â€“", "â€”", "â€ž", "â€œ", "â€™", "â€¦")
 
-def _maybe_fix_mojibake(s: str) -> str:
+# very targeted mapping for the exact garbage you are seeing
+_MOJIBAKE_MAP = {
+    "Â©": "©",
+    "Â§": "§",
+    "Â": "",           # remaining stray Â
+    "Ã¤": "ä",
+    "Ã„": "Ä",
+    "Ã¶": "ö",
+    "Ã–": "Ö",
+    "Ã¼": "ü",
+    "Ãœ": "Ü",
+    "ÃŸ": "ß",
+    "â€ž": "„",
+    "â€œ": "“",
+    "â€": "”",
+    "â€™": "’",
+    "â€˜": "‘",
+    "â€“": "–",
+    "â€”": "—",
+    "â€¦": "…",
+    "â‚¬": "€",
+}
+
+def _contains_mojibake(s: str) -> bool:
+    return any(sig in s for sig in _MOJIBAKE_SIGNALS)
+
+def _fix_by_redecode(s: str) -> Optional[str]:
     """
-    Heuristic repair for common mojibake in PDF extracted text.
-    Important: try cp1252 -> utf-8 first (handles '€' etc), then latin-1 -> utf-8.
+    Try to repair mojibake by re-decoding cp1252/latin-1 bytes as utf-8.
+    Returns a candidate string if it clearly improves, else None.
     """
-    if not s:
-        return s
-    if not any(sig in s for sig in _MOJIBAKE_SIGNALS):
-        return s
+    if not s or not _contains_mojibake(s):
+        return None
 
     old_bad = sum(s.count(sig) for sig in _MOJIBAKE_SIGNALS)
 
-    # 1) Try cp1252 -> utf-8
     for enc in ("cp1252", "latin-1"):
         try:
-            candidate = s.encode(enc, errors="strict").decode("utf-8", errors="strict")
+            cand = s.encode(enc, errors="strict").decode("utf-8", errors="strict")
         except Exception:
-            continue
+            cand = None
+        if cand:
+            new_bad = sum(cand.count(sig) for sig in _MOJIBAKE_SIGNALS)
+            if new_bad < old_bad:
+                return cand
 
-        new_bad = sum(candidate.count(sig) for sig in _MOJIBAKE_SIGNALS)
-        if new_bad < old_bad:
-            return candidate
-
-    # 2) As a last resort, try a permissive pass (never worse than current; may help partially)
+    # permissive fallback (handles mixed text)
     for enc in ("cp1252", "latin-1"):
         try:
-            candidate = s.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
+            cand = s.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
         except Exception:
-            continue
-        new_bad = sum(candidate.count(sig) for sig in _MOJIBAKE_SIGNALS)
-        if new_bad < old_bad:
-            return candidate
+            cand = None
+        if cand:
+            new_bad = sum(cand.count(sig) for sig in _MOJIBAKE_SIGNALS)
+            if new_bad < old_bad:
+                return cand
 
+    return None
+
+def _fix_by_mapping(s: str) -> str:
+    """
+    Deterministic replacement for common cp1252/utf-8 mojibake sequences.
+    Run a few passes until stable.
+    """
+    if not s or not _contains_mojibake(s):
+        return s
+
+    for _ in range(3):
+        before = s
+        for k, v in _MOJIBAKE_MAP.items():
+            if k in s:
+                s = s.replace(k, v)
+        if s == before:
+            break
     return s
 
 def _clean_text(s: str) -> str:
@@ -235,7 +276,15 @@ def _clean_text(s: str) -> str:
         return ""
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = unicodedata.normalize("NFC", s)
-    s = _maybe_fix_mojibake(s)
+
+    # 1) try safe re-decode repair
+    cand = _fix_by_redecode(s)
+    if cand is not None:
+        s = cand
+
+    # 2) always apply mapping repair afterwards (handles mixed strings reliably)
+    s = _fix_by_mapping(s)
+
     s = unicodedata.normalize("NFC", s)
     return s
 
@@ -309,7 +358,7 @@ def health():
     }
 
 # =========================
-# Listing (optional helpers)
+# Listing
 # =========================
 
 @app.get("/collections")
