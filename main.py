@@ -7,12 +7,13 @@ import re
 import time
 import fitz  # PyMuPDF
 from html import escape
+import unicodedata
 
 # =========================
 # App
 # =========================
 
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.3.2"
 
 app = FastAPI(
     title="Zotero FastAPI Proxy",
@@ -67,12 +68,6 @@ def _tags(item: Dict[str, Any]) -> List[str]:
         if isinstance(tag, str) and tag.strip():
             out.append(tag.strip())
     return out
-
-def _parse_year_from_query(q: str) -> str:
-    if not q:
-        return ""
-    m = re.search(r"\b(19|20)\d{2}\b", q)
-    return m.group(0) if m else ""
 
 def _score_match_biblio(
     title: Optional[str],
@@ -195,51 +190,69 @@ def _zotero_server_search_items(
     return items[:limit], fetched
 
 # =========================
-# Conservative mojibake repair (optional)
+# Text cleanup for PDF extraction
 # =========================
 
-_MOJIBAKE_MARKERS = ("Ã", "Â", "â€", "â€“", "â€œ", "â€ž", "â€™")
-_REPLACEMENT_CHAR = "\ufffd"  # "�"
+_MOJIBAKE_SIGNALS = ("Â", "Ã", "â€", "â€“", "â€”", "â€ž", "â€œ", "â€™", "â€¦")
 
-def _mojibake_score(s: str) -> int:
-    # Lower is better
+def _maybe_fix_mojibake(s: str) -> str:
+    """
+    Heuristic: if a string looks like UTF-8 bytes mis-decoded as latin-1,
+    try latin-1 -> utf-8 re-decode.
+    Example: "Ã¶" -> "ö", "Â©" -> "©".
+    """
     if not s:
-        return 0
-    return sum(s.count(m) for m in _MOJIBAKE_MARKERS) + 5 * s.count(_REPLACEMENT_CHAR)
-
-def _try_repair(s: str, enc: str) -> Optional[str]:
+        return s
+    if not any(sig in s for sig in _MOJIBAKE_SIGNALS):
+        return s
     try:
-        b = s.encode(enc, errors="strict")
-        return b.decode("utf-8", errors="strict")
+        candidate = s.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
     except Exception:
-        return None
-
-def _maybe_fix_text(s: str) -> str:
-    # Only attempt repair if it "looks like" mojibake
-    if not s or not any(m in s for m in _MOJIBAKE_MARKERS):
         return s
 
-    base = s
-    base_score = _mojibake_score(base)
+    # Accept candidate only if it reduces mojibake signals noticeably
+    old_bad = sum(s.count(sig) for sig in _MOJIBAKE_SIGNALS)
+    new_bad = sum(candidate.count(sig) for sig in _MOJIBAKE_SIGNALS)
+    return candidate if new_bad < old_bad else s
 
-    # Two common reverse paths: cp1252 and latin1
-    cand1 = _try_repair(base, "cp1252")
-    cand2 = _try_repair(base, "latin1")
+def _clean_text(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = unicodedata.normalize("NFC", s)
+    s = _maybe_fix_mojibake(s)
+    # Normalize again after potential re-decode
+    s = unicodedata.normalize("NFC", s)
+    return s
 
-    best = base
-    best_score = base_score
+def _page_text(page: fitz.Page) -> str:
+    # Using "text" is fine; we just normalize and repair typical mojibake patterns
+    return _clean_text(page.get_text())
 
-    for cand in [cand1, cand2]:
-        if not cand:
-            continue
-        sc = _mojibake_score(cand)
+def _snippet_around(text: str, phrase: str, radius: int = 600) -> str:
+    """
+    Return a snippet around the first match (case-insensitive).
+    Falls back to the beginning if match index can't be found.
+    """
+    if not text:
+        return ""
+    if not phrase:
+        return text[: min(len(text), 2 * radius)]
 
-        # Accept only if clearly better (strictly lower score)
-        if sc < best_score:
-            best = cand
-            best_score = sc
+    tl = text.lower()
+    pl = phrase.lower()
+    idx = tl.find(pl)
+    if idx == -1:
+        return text[: min(len(text), 2 * radius)]
 
-    return best
+    start = max(0, idx - radius)
+    end = min(len(text), idx + len(phrase) + radius)
+    snip = text[start:end]
+    if start > 0:
+        snip = "…" + snip
+    if end < len(text):
+        snip = snip + "…"
+    return snip
 
 # =========================
 # Very small in-memory cache for resolve-biblio
@@ -280,10 +293,14 @@ def _cache_set(key: str, payload: Dict[str, Any]) -> None:
 @app.get("/health")
 def health():
     r = requests.get(f"{ZOTERO_BASE}/items?limit=1", headers=HEADERS, timeout=10)
-    return {"ok": True, "app_version": APP_VERSION, "zotero_status": r.status_code}
+    return {
+        "ok": True,
+        "app_version": APP_VERSION,
+        "zotero_status": r.status_code,
+    }
 
 # =========================
-# Listing
+# Listing (optional helpers)
 # =========================
 
 @app.get("/collections")
@@ -363,7 +380,12 @@ def resolve_biblio(
             break
 
     payload = {
-        "query": {"title": title, "creator": creator, "year": year, "collection_key": collection_key},
+        "query": {
+            "title": title,
+            "creator": creator,
+            "year": year,
+            "collection_key": collection_key,
+        },
         "server_fetched": fetched,
         "pdf_checked": pdf_checked,
         "results": results,
@@ -377,7 +399,7 @@ def resolve_biblio(
 # =========================
 
 @app.get("/attachments/{attachment_key}/html", response_class=HTMLResponse)
-def pdf_as_html(attachment_key: str, fix_encoding: bool = False):
+def pdf_as_html(attachment_key: str):
     attachment_key = _to_str(attachment_key)
     if not attachment_key:
         raise HTTPException(status_code=400, detail="attachment_key required")
@@ -387,26 +409,22 @@ def pdf_as_html(attachment_key: str, fix_encoding: bool = False):
 
     parts = ["<html><head><meta charset='utf-8'></head><body>"]
     for page in doc:
-        txt = page.get_text() or ""
-        if fix_encoding:
-            txt = _maybe_fix_text(txt)
-        parts.append(f"<p>{escape(txt)}</p>")
+        parts.append(f"<p>{escape(_page_text(page))}</p>")
     parts.append("</body></html>")
 
     html = "".join(parts)
     return HTMLResponse(content=html, media_type="text/html; charset=utf-8")
 
 # =========================
-# PDF SEARCH
+# PDF SEARCH (now uses the same cleaned text path as HTML)
 # =========================
 
 @app.get("/attachments/{attachment_key}/search")
 def pdf_search(
     attachment_key: str,
     phrase: str,
-    fix_encoding: bool = False,
-    snippet_len: int = 1200,
     max_hits: int = 10,
+    snippet_radius: int = 600,
 ):
     attachment_key = _to_str(attachment_key)
     phrase = _to_str(phrase)
@@ -414,31 +432,26 @@ def pdf_search(
     if not attachment_key:
         raise HTTPException(status_code=400, detail="attachment_key required")
     if not phrase:
-        raise HTTPException(status_code=400, detail="phrase must be a non-empty string")
+        raise HTTPException(status_code=400, detail="phrase required")
 
     r = _get(f"{ZOTERO_BASE}/items/{attachment_key}/file")
     doc = fitz.open(stream=r.content, filetype="pdf")
 
-    needle = phrase.lower()
     hits = []
+    pl = phrase.lower()
 
     for i, page in enumerate(doc):
-        text = page.get_text() or ""
-        if fix_encoding:
-            text = _maybe_fix_text(text)
-
-        if needle in text.lower():
-            low = text.lower()
-            pos = low.find(needle)
-            if pos >= 0:
-                start = max(0, pos - snippet_len // 3)
-                end = min(len(text), pos + len(phrase) + snippet_len)
-                snippet = text[start:end]
-            else:
-                snippet = text[:snippet_len]
-
-            hits.append({"page": i + 1, "snippet": snippet})
+        text = _page_text(page)
+        if pl in text.lower():
+            hits.append({
+                "page": i + 1,
+                "snippet": _snippet_around(text, phrase, radius=snippet_radius),
+            })
             if len(hits) >= max_hits:
                 break
 
-    return {"attachment_key": attachment_key, "phrase": phrase, "hits": hits}
+    return {
+        "attachment_key": attachment_key,
+        "phrase": phrase,
+        "hits": hits,
+    }
