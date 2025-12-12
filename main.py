@@ -7,13 +7,12 @@ import re
 import time
 import fitz  # PyMuPDF
 from html import escape
-import unicodedata
 
 # =========================
 # App
 # =========================
 
-APP_VERSION = "2.3.4"
+APP_VERSION = "2.3.5"
 
 app = FastAPI(
     title="Zotero FastAPI Proxy",
@@ -46,8 +45,62 @@ def _get(url: str, params: dict = None) -> requests.Response:
 def _to_str(x) -> Optional[str]:
     return x.strip() if isinstance(x, str) and x.strip() else None
 
+def _contains_mojibake(s: str) -> bool:
+    # Typical UTF-8-as-Latin1/CP1252 mojibake markers
+    if not s:
+        return False
+    markers = ["Ã", "Â", "â€", "â€™", "â€œ", "â€�", "â€“", "â€”", "ï¿½"]
+    return any(m in s for m in markers)
+
+def _try_recode(s: str, src: str, dst: str) -> str:
+    try:
+        return s.encode(src, errors="strict").decode(dst, errors="strict")
+    except Exception:
+        return s
+
+def _clean_text(s: Optional[str]) -> str:
+    """
+    Fix common mojibake caused by UTF-8 text wrongly decoded as Latin-1 / CP1252.
+    Also normalizes a few frequent remnants.
+    """
+    if not isinstance(s, str) or not s:
+        return ""
+
+    out = s
+
+    # 1) Heuristic recode attempts (only if it looks broken)
+    if _contains_mojibake(out):
+        # Typical case: UTF-8 bytes were decoded as Latin-1 -> "Ã¤" etc.
+        out2 = _try_recode(out, "latin-1", "utf-8")
+        if out2 != out:
+            out = out2
+
+    if _contains_mojibake(out):
+        # Alternative frequent case: CP1252/latin mix -> try CP1252 -> UTF-8
+        out2 = _try_recode(out, "cp1252", "utf-8")
+        if out2 != out:
+            out = out2
+
+    # 2) Targeted replacements (covers cases where recode did not apply cleanly)
+    # Quotes and dashes
+    out = out.replace("â€ž", "„").replace("â€œ", "“").replace("â€�", "”")
+    out = out.replace("â€™", "’").replace("â€˜", "‘")
+    out = out.replace("â€“", "–").replace("â€”", "—")
+    out = out.replace("â€¦", "…")
+
+    # Common leftovers with stray "Â"
+    out = out.replace("Â©", "©")
+    out = out.replace("Â§", "§")
+    out = out.replace("Â°", "°")
+    out = out.replace("Â·", "·")
+    out = out.replace("Â ", " ")  # NBSP-ish artifact in some runs
+    out = out.replace("\u00a0", " ")  # real NBSP to space
+
+    return out
+
 def _year(item: Dict[str, Any]) -> str:
     d = (item.get("data", {}) or {}).get("date", "") or ""
+    d = _clean_text(d)
     m = re.search(r"\b(19|20)\d{2}\b", d)
     return m.group(0) if m else ""
 
@@ -57,7 +110,7 @@ def _creator_string(item: Dict[str, Any]) -> str:
     for c in creators:
         ln = c.get("lastName")
         if isinstance(ln, str) and ln.strip():
-            names.append(ln.strip())
+            names.append(_clean_text(ln.strip()))
     return ", ".join(names)
 
 def _tags(item: Dict[str, Any]) -> List[str]:
@@ -66,7 +119,7 @@ def _tags(item: Dict[str, Any]) -> List[str]:
     for t in tags:
         tag = t.get("tag")
         if isinstance(tag, str) and tag.strip():
-            out.append(tag.strip())
+            out.append(_clean_text(tag.strip()))
     return out
 
 def _score_match_biblio(
@@ -76,16 +129,16 @@ def _score_match_biblio(
     item: Dict[str, Any],
 ) -> Tuple[int, str]:
     data = item.get("data", {}) or {}
-    it_title = (data.get("title") or "").lower()
-    it_creators = _creator_string(item).lower()
+    it_title = _clean_text(data.get("title") or "").lower()
+    it_creators = _clean_text(_creator_string(item)).lower()
     it_year = _year(item)
 
     score = 0
     reasons = []
 
     if title:
-        t = title.lower()
-        if t in it_title:
+        t = _clean_text(title).lower()
+        if t and t in it_title:
             score += 8
             reasons.append("title_match")
         else:
@@ -96,8 +149,8 @@ def _score_match_biblio(
                 reasons.append(f"title_token_hits:{hits}")
 
     if creator:
-        c = creator.lower()
-        if c in it_creators:
+        c = _clean_text(creator).lower()
+        if c and c in it_creators:
             score += 6
             reasons.append("creator_match")
         else:
@@ -138,10 +191,10 @@ def _compact_item(
     return {
         "item_key": data.get("key"),
         "itemType": data.get("itemType"),
-        "title": data.get("title"),
-        "creators": _creator_string(item),
+        "title": _clean_text(data.get("title")),
+        "creators": _clean_text(_creator_string(item)),
         "year": _year(item),
-        "publicationTitle": data.get("publicationTitle"),
+        "publicationTitle": _clean_text(data.get("publicationTitle")),
         "collections": data.get("collections", []),
         "tags": _tags(item),
         "has_pdf": has_pdf,
@@ -157,6 +210,8 @@ def _zotero_server_search_items(
     max_fetch: int,
 ) -> Tuple[List[Dict[str, Any]], int]:
     q = _to_str(q) or ""
+    q = _clean_text(q)
+
     fetched = 0
     start = 0
     chunk = min(100, max_fetch)
@@ -190,129 +245,6 @@ def _zotero_server_search_items(
     return items[:limit], fetched
 
 # =========================
-# Text cleanup for PDF extraction
-# =========================
-
-_MOJIBAKE_SIGNALS = ("Â", "Ã", "â€", "â€“", "â€”", "â€ž", "â€œ", "â€™", "â€¦")
-
-# very targeted mapping for the exact garbage you are seeing
-_MOJIBAKE_MAP = {
-    "Â©": "©",
-    "Â§": "§",
-    "Â": "",           # remaining stray Â
-    "Ã¤": "ä",
-    "Ã„": "Ä",
-    "Ã¶": "ö",
-    "Ã–": "Ö",
-    "Ã¼": "ü",
-    "Ãœ": "Ü",
-    "ÃŸ": "ß",
-    "â€ž": "„",
-    "â€œ": "“",
-    "â€": "”",
-    "â€™": "’",
-    "â€˜": "‘",
-    "â€“": "–",
-    "â€”": "—",
-    "â€¦": "…",
-    "â‚¬": "€",
-}
-
-def _contains_mojibake(s: str) -> bool:
-    return any(sig in s for sig in _MOJIBAKE_SIGNALS)
-
-def _fix_by_redecode(s: str) -> Optional[str]:
-    """
-    Try to repair mojibake by re-decoding cp1252/latin-1 bytes as utf-8.
-    Returns a candidate string if it clearly improves, else None.
-    """
-    if not s or not _contains_mojibake(s):
-        return None
-
-    old_bad = sum(s.count(sig) for sig in _MOJIBAKE_SIGNALS)
-
-    for enc in ("cp1252", "latin-1"):
-        try:
-            cand = s.encode(enc, errors="strict").decode("utf-8", errors="strict")
-        except Exception:
-            cand = None
-        if cand:
-            new_bad = sum(cand.count(sig) for sig in _MOJIBAKE_SIGNALS)
-            if new_bad < old_bad:
-                return cand
-
-    # permissive fallback (handles mixed text)
-    for enc in ("cp1252", "latin-1"):
-        try:
-            cand = s.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
-        except Exception:
-            cand = None
-        if cand:
-            new_bad = sum(cand.count(sig) for sig in _MOJIBAKE_SIGNALS)
-            if new_bad < old_bad:
-                return cand
-
-    return None
-
-def _fix_by_mapping(s: str) -> str:
-    """
-    Deterministic replacement for common cp1252/utf-8 mojibake sequences.
-    Run a few passes until stable.
-    """
-    if not s or not _contains_mojibake(s):
-        return s
-
-    for _ in range(3):
-        before = s
-        for k, v in _MOJIBAKE_MAP.items():
-            if k in s:
-                s = s.replace(k, v)
-        if s == before:
-            break
-    return s
-
-def _clean_text(s: str) -> str:
-    if not isinstance(s, str):
-        return ""
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = unicodedata.normalize("NFC", s)
-
-    # 1) try safe re-decode repair
-    cand = _fix_by_redecode(s)
-    if cand is not None:
-        s = cand
-
-    # 2) always apply mapping repair afterwards (handles mixed strings reliably)
-    s = _fix_by_mapping(s)
-
-    s = unicodedata.normalize("NFC", s)
-    return s
-
-def _page_text(page: fitz.Page) -> str:
-    return _clean_text(page.get_text())
-
-def _snippet_around(text: str, phrase: str, radius: int = 600) -> str:
-    if not text:
-        return ""
-    if not phrase:
-        return text[: min(len(text), 2 * radius)]
-
-    tl = text.lower()
-    pl = phrase.lower()
-    idx = tl.find(pl)
-    if idx == -1:
-        return text[: min(len(text), 2 * radius)]
-
-    start = max(0, idx - radius)
-    end = min(len(text), idx + len(phrase) + radius)
-    snip = text[start:end]
-    if start > 0:
-        snip = "…" + snip
-    if end < len(text):
-        snip = snip + "…"
-    return snip
-
-# =========================
 # Very small in-memory cache for resolve-biblio
 # =========================
 
@@ -343,6 +275,21 @@ def _cache_get(key: str) -> Optional[Dict[str, Any]]:
 
 def _cache_set(key: str, payload: Dict[str, Any]) -> None:
     _RESOLVE_CACHE[key] = (time.time(), payload)
+
+# =========================
+# Debug: mojibake cleaner
+# =========================
+
+@app.get("/debug/clean")
+def debug_clean(s: str):
+    s = s or ""
+    cleaned = _clean_text(s)
+    return {
+        "raw": s[:400],
+        "clean": cleaned[:400],
+        "raw_has_mojibake": _contains_mojibake(s),
+        "clean_has_mojibake": _contains_mojibake(cleaned),
+    }
 
 # =========================
 # Health
@@ -467,7 +414,8 @@ def pdf_as_html(attachment_key: str):
 
     parts = ["<html><head><meta charset='utf-8'></head><body>"]
     for page in doc:
-        parts.append(f"<p>{escape(_page_text(page))}</p>")
+        page_text = _clean_text(page.get_text())
+        parts.append(f"<p>{escape(page_text)}</p>")
     parts.append("</body></html>")
 
     html = "".join(parts)
@@ -478,12 +426,7 @@ def pdf_as_html(attachment_key: str):
 # =========================
 
 @app.get("/attachments/{attachment_key}/search")
-def pdf_search(
-    attachment_key: str,
-    phrase: str,
-    max_hits: int = 10,
-    snippet_radius: int = 600,
-):
+def pdf_search(attachment_key: str, phrase: str):
     attachment_key = _to_str(attachment_key)
     phrase = _to_str(phrase)
 
@@ -496,17 +439,21 @@ def pdf_search(
     doc = fitz.open(stream=r.content, filetype="pdf")
 
     hits = []
-    pl = phrase.lower()
+    needle = phrase.lower()
 
     for i, page in enumerate(doc):
-        text = _page_text(page)
-        if pl in text.lower():
+        text_raw = page.get_text()
+        text = _clean_text(text_raw)
+
+        if needle in text.lower():
+            snippet = text[:1000]
             hits.append({
                 "page": i + 1,
-                "snippet": _snippet_around(text, phrase, radius=snippet_radius),
+                "snippet": snippet
             })
-            if len(hits) >= max_hits:
-                break
+
+        if len(hits) >= 10:
+            break
 
     return {
         "attachment_key": attachment_key,
