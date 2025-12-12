@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import os
 import requests
 import re
+import unicodedata
 import fitz  # PyMuPDF
 from html import escape
 
@@ -10,7 +11,7 @@ from html import escape
 # App
 # =========================
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 app = FastAPI(
     title="Zotero FastAPI Proxy",
@@ -40,8 +41,12 @@ def _get(url: str, params: dict = None) -> requests.Response:
     r.raise_for_status()
     return r
 
-def _to_str(x):
-    return x if isinstance(x, str) and x.strip() else None
+def _normalize(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")
+    return s.lower().strip()
 
 def _year(item):
     d = (item.get("data", {}) or {}).get("date", "")
@@ -59,53 +64,16 @@ def _creator_string(item):
 def _tags(item):
     return [t.get("tag", "") for t in (item.get("data", {}) or {}).get("tags", [])]
 
-def _parse_year_from_query(q: str) -> str:
-    if not q:
-        return ""
-    m = re.search(r"\b(19|20)\d{2}\b", q)
-    return m.group(0) if m else ""
-
-def _score_match_free(
-    free: str,
-    item: Dict[str, Any],
-    prefer_year: Optional[str] = None,
-    prefer_creator: Optional[str] = None,
-) -> Tuple[int, str]:
-    data = item.get("data", {}) or {}
-    haystack = " ".join([
-        data.get("title", ""),
-        _creator_string(item),
-        data.get("publicationTitle", ""),
-        " ".join(_tags(item)),
-    ]).lower()
-
-    tokens = free.lower().split()
-    hits = sum(1 for t in tokens if t in haystack)
-
-    score = hits
-    if prefer_year and prefer_year == _year(item):
-        score += 2
-    if prefer_creator and prefer_creator.lower() in _creator_string(item).lower():
-        score += 2
-
-    return score, f"token_hits:{hits}"
-
 def _pdf_attachment_keys(item_key: str) -> List[str]:
     r = _get(f"{ZOTERO_BASE}/items/{item_key}/children")
-    pdfs = []
-    for c in r.json():
-        d = c.get("data", {}) or {}
-        if d.get("itemType") == "attachment" and d.get("contentType") == "application/pdf":
-            pdfs.append(d.get("key"))
-    return pdfs
+    return [
+        c["data"]["key"]
+        for c in r.json()
+        if c.get("data", {}).get("itemType") == "attachment"
+        and c.get("data", {}).get("contentType") == "application/pdf"
+    ]
 
-def _compact_item(
-    item: Dict[str, Any],
-    has_pdf: bool,
-    pdf_keys: List[str],
-    match_reason: str,
-    score: int,
-) -> Dict[str, Any]:
+def _compact_item(item, pdf_keys, score, reason):
     data = item.get("data", {}) or {}
     return {
         "item_key": data.get("key"),
@@ -116,10 +84,10 @@ def _compact_item(
         "publicationTitle": data.get("publicationTitle"),
         "collections": data.get("collections", []),
         "tags": _tags(item),
-        "has_pdf": has_pdf,
+        "has_pdf": bool(pdf_keys),
         "pdf_attachment_keys": pdf_keys,
-        "match_reason": match_reason,
         "score": score,
+        "match_reason": reason,
     }
 
 # =========================
@@ -136,36 +104,25 @@ def health():
     }
 
 # =========================
-# Listing
+# NEW: BIBLIOGRAPHIC RESOLVE
 # =========================
 
-@app.get("/items")
-def list_items(limit: int = 100, start: int = 0):
-    r = _get(f"{ZOTERO_BASE}/items", params={"limit": limit, "start": start, "itemType": "-attachment"})
-    return r.json()
-
-@app.get("/collections")
-def list_collections():
-    return _get(f"{ZOTERO_BASE}/collections").json()
-
-# =========================
-# SEARCH (broad, performant)
-# =========================
-
-@app.get("/search")
-def search(
-    q: Optional[str] = None,
+@app.get("/resolve-biblio")
+def resolve_biblio(
+    title: Optional[str] = None,
+    creator: Optional[str] = None,
+    year: Optional[str] = None,
     collection_key: Optional[str] = None,
-    has_pdf: bool = True,
-    limit: int = 20,
-    max_scan: int = 2000,
-    pdf_check_top_n: int = 300,
+    limit: int = 10,
+    max_scan: int = 3000,
 ):
-    q = _to_str(q)
-    prefer_year = _parse_year_from_query(q or "")
-    scanned = 0
+    nt = _normalize(title)
+    nc = _normalize(creator)
+    ny = year
+
     start = 0
     chunk = 100
+    scanned = 0
     scored = []
 
     while scanned < max_scan:
@@ -185,9 +142,27 @@ def search(
             break
 
         for it in batch:
-            score, reason = _score_match_free(q, it, prefer_year)
+            data = it.get("data", {}) or {}
+            score = 0
+            reasons = []
+
+            it_title = _normalize(data.get("title"))
+            it_creators = _normalize(_creator_string(it))
+
+            if nt and nt in it_title:
+                score += 10
+                reasons.append("title_match")
+
+            if nc and nc in it_creators:
+                score += 6
+                reasons.append("creator_match")
+
+            if ny and ny == _year(it):
+                score += 3
+                reasons.append("year_match")
+
             if score > 0:
-                scored.append((score, reason, it))
+                scored.append((score, reasons, it))
 
         scanned += len(batch)
         start += chunk
@@ -195,41 +170,20 @@ def search(
     scored.sort(key=lambda x: x[0], reverse=True)
 
     results = []
-    checked = 0
-
-    for score, reason, it in scored:
-        if has_pdf and checked >= pdf_check_top_n:
-            break
-
+    for score, reasons, it in scored[:limit]:
         key = it["data"]["key"]
-        pdfs = _pdf_attachment_keys(key) if has_pdf else []
-        checked += 1
-
-        if has_pdf and not pdfs:
-            continue
-
-        results.append(_compact_item(it, bool(pdfs), pdfs, reason, score))
-        if len(results) >= limit:
-            break
+        pdfs = _pdf_attachment_keys(key)
+        results.append(_compact_item(it, pdfs, score, ",".join(reasons)))
 
     return {
-        "query": q,
+        "query": {
+            "title": title,
+            "creator": creator,
+            "year": year,
+            "collection_key": collection_key,
+        },
         "scanned": scanned,
-        "pdf_checked": checked,
         "results": results,
-    }
-
-# =========================
-# RESOLVE (precise)
-# =========================
-
-@app.get("/resolve")
-def resolve(query: str, limit: int = 5):
-    res = search(q=query, limit=limit * 5)
-    candidates = res["results"][:limit]
-    return {
-        "query": query,
-        "candidates": candidates,
     }
 
 # =========================
@@ -237,7 +191,6 @@ def resolve(query: str, limit: int = 5):
 # =========================
 
 from fastapi.responses import HTMLResponse
-from html import escape
 
 @app.get("/attachments/{attachment_key}/html", response_class=HTMLResponse)
 def pdf_as_html(attachment_key: str):
@@ -249,29 +202,4 @@ def pdf_as_html(attachment_key: str):
         parts.append(f"<p>{escape(page.get_text())}</p>")
     parts.append("</body></html>")
 
-    html = "".join(parts)
-    return HTMLResponse(content=html, media_type="text/html; charset=utf-8")
-
-# =========================
-# PDF SEARCH
-# =========================
-
-@app.get("/attachments/{attachment_key}/search")
-def pdf_search(attachment_key: str, phrase: str):
-    r = _get(f"{ZOTERO_BASE}/items/{attachment_key}/file")
-    doc = fitz.open(stream=r.content, filetype="pdf")
-
-    hits = []
-    for i, page in enumerate(doc):
-        text = page.get_text()
-        if phrase.lower() in text.lower():
-            hits.append({
-                "page": i + 1,
-                "snippet": text[:1000]
-            })
-
-    return {
-        "attachment_key": attachment_key,
-        "phrase": phrase,
-        "hits": hits[:10],
-    }
+    return HTMLResponse("".join(parts), media_type="text/html; charset=utf-8")
