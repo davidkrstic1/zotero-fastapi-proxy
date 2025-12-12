@@ -236,17 +236,21 @@ def resolve(query: str, limit: int = 5):
 # PDF HTML
 # =========================
 
-@app.get("/attachments/{attachment_key}/html")
+from fastapi.responses import HTMLResponse
+from html import escape
+
+@app.get("/attachments/{attachment_key}/html", response_class=HTMLResponse)
 def pdf_as_html(attachment_key: str):
     r = _get(f"{ZOTERO_BASE}/items/{attachment_key}/file")
     doc = fitz.open(stream=r.content, filetype="pdf")
 
-    html = "<html><body>"
+    parts = ["<html><head><meta charset='utf-8'></head><body>"]
     for page in doc:
-        html += f"<p>{escape(page.get_text())}</p>"
-    html += "</body></html>"
+        parts.append(f"<p>{escape(page.get_text())}</p>")
+    parts.append("</body></html>")
 
-    return html
+    html = "".join(parts)
+    return HTMLResponse(content=html, media_type="text/html; charset=utf-8")
 
 # =========================
 # PDF SEARCH
