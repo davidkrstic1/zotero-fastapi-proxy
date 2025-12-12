@@ -12,7 +12,7 @@ from html import escape
 # App
 # =========================
 
-APP_VERSION = "2.3.5"
+APP_VERSION = "2.3.6"
 
 app = FastAPI(
     title="Zotero FastAPI Proxy",
@@ -45,56 +45,57 @@ def _get(url: str, params: dict = None) -> requests.Response:
 def _to_str(x) -> Optional[str]:
     return x.strip() if isinstance(x, str) and x.strip() else None
 
-def _contains_mojibake(s: str) -> bool:
-    # Typical UTF-8-as-Latin1/CP1252 mojibake markers
+_MOJIBAKE_MARKERS = ["Ã", "Â", "â€", "â€™", "â€œ", "â€�", "â€“", "â€”", "ï¿½", "�"]
+
+def _mojibake_score(s: str) -> int:
     if not s:
-        return False
-    markers = ["Ã", "Â", "â€", "â€™", "â€œ", "â€�", "â€“", "â€”", "ï¿½"]
-    return any(m in s for m in markers)
+        return 0
+    return sum(s.count(m) for m in _MOJIBAKE_MARKERS)
 
 def _try_recode(s: str, src: str, dst: str) -> str:
+    """
+    Recode with tolerant error handling so one single non-encodable char does not
+    prevent fixing the rest of the string.
+    """
     try:
-        return s.encode(src, errors="strict").decode(dst, errors="strict")
+        b = s.encode(src, errors="ignore")
+        return b.decode(dst, errors="ignore")
     except Exception:
         return s
 
 def _clean_text(s: Optional[str]) -> str:
-    """
-    Fix common mojibake caused by UTF-8 text wrongly decoded as Latin-1 / CP1252.
-    Also normalizes a few frequent remnants.
-    """
     if not isinstance(s, str) or not s:
         return ""
 
-    out = s
+    original = s
 
-    # 1) Heuristic recode attempts (only if it looks broken)
-    if _contains_mojibake(out):
-        # Typical case: UTF-8 bytes were decoded as Latin-1 -> "Ã¤" etc.
-        out2 = _try_recode(out, "latin-1", "utf-8")
-        if out2 != out:
-            out = out2
+    # Candidate 1: latin-1 -> utf-8
+    c1 = _try_recode(original, "latin-1", "utf-8")
 
-    if _contains_mojibake(out):
-        # Alternative frequent case: CP1252/latin mix -> try CP1252 -> UTF-8
-        out2 = _try_recode(out, "cp1252", "utf-8")
-        if out2 != out:
-            out = out2
+    # Candidate 2: cp1252 -> utf-8 (handles €-based mojibake sequences like â€ž)
+    c2 = _try_recode(original, "cp1252", "utf-8")
 
-    # 2) Targeted replacements (covers cases where recode did not apply cleanly)
-    # Quotes and dashes
+    # Pick the best candidate by mojibake score (lower is better).
+    best = original
+    best_score = _mojibake_score(best)
+
+    for cand in (c1, c2):
+        sc = _mojibake_score(cand)
+        if sc < best_score:
+            best = cand
+            best_score = sc
+
+    out = best
+
+    # Targeted replacements for residual sequences that sometimes survive recode
     out = out.replace("â€ž", "„").replace("â€œ", "“").replace("â€�", "”")
     out = out.replace("â€™", "’").replace("â€˜", "‘")
     out = out.replace("â€“", "–").replace("â€”", "—")
     out = out.replace("â€¦", "…")
 
-    # Common leftovers with stray "Â"
-    out = out.replace("Â©", "©")
-    out = out.replace("Â§", "§")
-    out = out.replace("Â°", "°")
-    out = out.replace("Â·", "·")
-    out = out.replace("Â ", " ")  # NBSP-ish artifact in some runs
-    out = out.replace("\u00a0", " ")  # real NBSP to space
+    out = out.replace("Â©", "©").replace("Â§", "§").replace("Â°", "°").replace("Â·", "·")
+    out = out.replace("\u00a0", " ")
+    out = out.replace("Â ", " ")
 
     return out
 
@@ -249,7 +250,7 @@ def _zotero_server_search_items(
 # =========================
 
 _RESOLVE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-_RESOLVE_TTL_SECONDS = 15 * 60  # 15 minutes
+_RESOLVE_TTL_SECONDS = 15 * 60
 
 def _cache_key(title, creator, year, collection_key, limit, max_fetch, require_pdf) -> str:
     return "|".join([
@@ -275,21 +276,6 @@ def _cache_get(key: str) -> Optional[Dict[str, Any]]:
 
 def _cache_set(key: str, payload: Dict[str, Any]) -> None:
     _RESOLVE_CACHE[key] = (time.time(), payload)
-
-# =========================
-# Debug: mojibake cleaner
-# =========================
-
-@app.get("/debug/clean")
-def debug_clean(s: str):
-    s = s or ""
-    cleaned = _clean_text(s)
-    return {
-        "raw": s[:400],
-        "clean": cleaned[:400],
-        "raw_has_mojibake": _contains_mojibake(s),
-        "clean_has_mojibake": _contains_mojibake(cleaned),
-    }
 
 # =========================
 # Health
@@ -442,21 +428,10 @@ def pdf_search(attachment_key: str, phrase: str):
     needle = phrase.lower()
 
     for i, page in enumerate(doc):
-        text_raw = page.get_text()
-        text = _clean_text(text_raw)
-
+        text = _clean_text(page.get_text())
         if needle in text.lower():
-            snippet = text[:1000]
-            hits.append({
-                "page": i + 1,
-                "snippet": snippet
-            })
-
+            hits.append({"page": i + 1, "snippet": text[:1000]})
         if len(hits) >= 10:
             break
 
-    return {
-        "attachment_key": attachment_key,
-        "phrase": phrase,
-        "hits": hits,
-    }
+    return {"attachment_key": attachment_key, "phrase": phrase, "hits": hits}
